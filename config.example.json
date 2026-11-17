@@ -1,0 +1,21 @@
+{
+  "min_age_days": 2,
+  "unsub_min_emails": 2,
+  "protect_senders": [
+    "@yourbank\\.com$",
+    "@yourclient\\.com$",
+    "^billing@"
+  ],
+  "protect_subjects": [
+    "visa",
+    "tenancy"
+  ],
+  "keep_transactional": true,
+  "gmail": {
+    "oauth_client_file": "~/.inbox-cleanup/gmail_oauth_client.json"
+  },
+  "outlook": {
+    "client_id": "YOUR-AZURE-APP-CLIENT-ID",
+    "tenant": "common"
+  }
+}
