@@ -1,4 +1,4 @@
-"""Gmail provider: OAuth, inbox scan, trash, send."""
+"""Gmail provider: OAuth, scan, move, send, block filters."""
 from __future__ import annotations
 
 import base64
@@ -9,14 +9,17 @@ from pathlib import Path
 
 from common import parse_addr, save_json, token_path
 
+SETTINGS_SCOPE = "https://www.googleapis.com/auth/gmail.settings.basic"
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.send",
+    SETTINGS_SCOPE,
 ]
 HEADERS = [
     "From", "To", "Subject", "List-Unsubscribe", "List-Unsubscribe-Post",
     "List-Id", "Precedence", "Auto-Submitted",
 ]
+LABEL = {"inbox": "INBOX", "trash": "TRASH", "spam": "SPAM", "archive": None}
 
 
 def _libs():
@@ -32,7 +35,7 @@ def _libs():
     return Request, Credentials, InstalledAppFlow, build
 
 
-def authorize(cfg: dict, alias: str, import_token: str | None = None) -> str:
+def authorize(cfg: dict, alias: str, import_token: str | None = None, **_) -> str:
     """Run browser consent (or import an existing authorized-user token)."""
     Request, Credentials, InstalledAppFlow, build = _libs()
     tp = token_path("gmail", alias)
@@ -53,8 +56,8 @@ def authorize(cfg: dict, alias: str, import_token: str | None = None) -> str:
     return svc.users().getProfile(userId="me").execute()["emailAddress"]
 
 
-def service(alias: str):
-    Request, Credentials, _, build = _libs()
+def _creds(alias: str):
+    Request, Credentials, _, _b = _libs()
     tp = token_path("gmail", alias)
     if not tp.exists():
         raise SystemExit(f"No Gmail token for '{alias}'. Run: cleanup.py auth gmail --alias {alias}")
@@ -62,14 +65,19 @@ def service(alias: str):
     if not creds.valid:
         creds.refresh(Request())
         save_json(tp, json.loads(creds.to_json()))
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return creds
 
 
-def _list_ids(svc, query: str, cap: int | None = None) -> list[str]:
+def service(alias: str):
+    build = _libs()[3]
+    return build("gmail", "v1", credentials=_creds(alias), cache_discovery=False)
+
+
+def _list_ids(svc, query: str, cap: int | None = None, spam: bool = False) -> list[str]:
     ids, tok = [], None
     while True:
         r = svc.users().messages().list(
-            userId="me", q=query, maxResults=500, pageToken=tok
+            userId="me", q=query, maxResults=500, pageToken=tok, includeSpamTrash=spam
         ).execute()
         ids += [m["id"] for m in r.get("messages", [])]
         tok = r.get("nextPageToken")
@@ -110,15 +118,17 @@ def _fetch_metadata(svc, ids: list[str], headers: list[str], log) -> dict:
     return res
 
 
-def scan(alias: str, log=print) -> dict:
-    """Return {'me': address, 'contacts': [...], 'messages': [...]} for the inbox."""
+def scan(cfg: dict, alias: str, include_spam: bool = False, log=print) -> dict:
+    """Return {'me': address, 'contacts': [...], 'messages': [...]}."""
     svc = service(alias)
     me = svc.users().getProfile(userId="me").execute()["emailAddress"].lower()
 
     log(f"[gmail:{alias}] listing inbox")
     ids = _list_ids(svc, "in:inbox")
-    log(f"[gmail:{alias}] {len(ids)} inbox emails, reading headers")
-    raw = _fetch_metadata(svc, ids, HEADERS, log)
+    spam_ids = set(_list_ids(svc, "in:spam", spam=True)) if include_spam else set()
+    log(f"[gmail:{alias}] {len(ids)} inbox emails"
+        + (f", {len(spam_ids)} in spam" if include_spam else "") + ", reading headers")
+    raw = _fetch_metadata(svc, ids + sorted(spam_ids), HEADERS, log)
 
     log(f"[gmail:{alias}] reading who you have written to")
     sent_ids = _list_ids(svc, "in:sent", cap=2000)
@@ -140,6 +150,7 @@ def scan(alias: str, log=print) -> dict:
             "id": mid,
             "provider": "gmail",
             "account": alias,
+            "folder": "spam" if mid in spam_ids else "inbox",
             "from": h.get("from", ""),
             "subject": h.get("subject", ""),
             "ts": int(m.get("internalDate", 0)),
@@ -158,23 +169,68 @@ def scan(alias: str, log=print) -> dict:
     return {"me": me, "contacts": sorted(contacts), "messages": msgs}
 
 
-def trash(alias: str, ids: list[str], log=print) -> int:
-    """Move messages to Trash (recoverable for 30 days)."""
+def move(cfg: dict, alias: str, ids: list[str], src: str, dest: str, log=print) -> list:
+    """Move messages between inbox, trash, spam and archive. Returns the ids moved.
+
+    Trash keeps email recoverable for 30 days.
+    """
     svc = service(alias)
-    done = 0
+    add = [LABEL[dest]] if LABEL[dest] else []
+    rem = [LABEL[src]] if LABEL[src] else []
+    out: list = []
     for i in range(0, len(ids), 1000):
         chunk = ids[i:i + 1000]
-        svc.users().messages().batchModify(
-            userId="me", body={"ids": chunk, "addLabelIds": ["TRASH"], "removeLabelIds": ["INBOX"]}
-        ).execute()
-        done += len(chunk)
-        log(f"[gmail:{alias}] trashed {done}/{len(ids)}")
-    return done
+        try:
+            svc.users().messages().batchModify(
+                userId="me", body={"ids": chunk, "addLabelIds": add, "removeLabelIds": rem}
+            ).execute()
+            out += chunk
+        except Exception as e:
+            log(f"[gmail:{alias}] batch failed ({str(e)[:80]}), retrying one by one")
+            for mid in chunk:
+                try:
+                    if src == "trash":
+                        svc.users().messages().untrash(userId="me", id=mid).execute()
+                    svc.users().messages().modify(
+                        userId="me", id=mid, body={"addLabelIds": add, "removeLabelIds": rem}
+                    ).execute()
+                    out.append(mid)
+                except Exception:
+                    out.append(None)
+        log(f"[gmail:{alias}] moved {len([x for x in out if x])}/{len(ids)} to {dest}")
+    return out
 
 
-def send(alias: str, to: str, subject: str, body: str) -> None:
+def send(cfg: dict, alias: str, to: str, subject: str, body: str) -> None:
     svc = service(alias)
     msg = MIMEText(body)
     msg["to"], msg["subject"] = to, subject
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+
+def block(cfg: dict, alias: str, senders: list[str], action: str = "trash") -> tuple[list, list]:
+    """Create a filter per sender so future mail skips the inbox."""
+    creds = _creds(alias)
+    if SETTINGS_SCOPE not in (creds.scopes or []):
+        raise SystemExit(
+            f"Gmail account '{alias}' was connected without permission to manage filters. "
+            f"Reconnect it once with: cleanup.py auth gmail --alias {alias}"
+        )
+    svc = service(alias)
+    act = {"removeLabelIds": ["INBOX"]}
+    if action == "trash":
+        act["addLabelIds"] = ["TRASH"]
+    ok, failed = [], []
+    for s in senders:
+        try:
+            svc.users().settings().filters().create(
+                userId="me", body={"criteria": {"from": s}, "action": act}
+            ).execute()
+            ok.append(s)
+        except Exception as e:
+            if "exists" in str(e).lower():
+                ok.append(s)
+            else:
+                failed.append(s)
+    return ok, failed

@@ -1,6 +1,9 @@
 {
   "min_age_days": 2,
   "unsub_min_emails": 2,
+  "ask_keep_read_rate": 0.5,
+  "archive_read_bulk_months": 0,
+  "block_action": "trash",
   "protect_senders": [
     "@yourbank\\.com$",
     "@yourclient\\.com$",
@@ -11,6 +14,7 @@
     "tenancy"
   ],
   "keep_transactional": true,
+  "notify_webhook": "",
   "gmail": {
     "oauth_client_file": "~/.inbox-cleanup/gmail_oauth_client.json"
   },
